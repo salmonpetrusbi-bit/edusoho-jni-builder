@@ -12,17 +12,20 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Clone llama.cpp (b4600) & Sesuaikan Pembersih KV Cache
+      - name: 2. Clone llama.cpp & Bersihkan Bendera -ffast-math di CMakeLists.txt
         run: |
           rm -rf llama.cpp
           git clone --depth 1 --branch b4600 https://github.com/ggerganov/llama.cpp.git llama.cpp
-          if grep -q "llama_kv_self_clear" llama.cpp/include/llama.h; then
-            echo "Menggunakan llama_kv_self_clear"
-          else
+          
+          # Hapus -ffast-math dari CMakeLists.txt karena menyebabkan ggml-cpu.c gagal dikompilasi di NDK Clang
+          sed -i 's/-ffast-math//g' CMakeLists.txt
+          
+          # Pastikan pemanggilan clear KV cache sesuai dengan header llama.h
+          if ! grep -q "llama_kv_self_clear" llama.cpp/include/llama.h; then
             sed -i 's/llama_kv_self_clear/llama_kv_cache_clear/g' llama_edusoho_jni.cpp
           fi
 
-      - name: 3. Deteksi Android NDK & Kompilasi CMake (arm64-v8a)
+      - name: 3. Kompilasi CMake (arm64-v8a) dengan Standar Resmi Android llama.cpp
         run: |
           NDK_PATH="${ANDROID_NDK_LATEST_HOME:-$(ls -d $ANDROID_HOME/ndk/* | tail -n 1)}"
           echo "Menggunakan NDK: $NDK_PATH"
@@ -33,6 +36,8 @@ jobs:
             -DANDROID_PLATFORM=android-28 \
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-march=armv8-a -Wno-error" \
+            -DCMAKE_CXX_FLAGS="-march=armv8-a -Wno-error" \
             -DGGML_NATIVE=OFF \
             -DGGML_OPENMP=OFF \
             -DGGML_LLAMAFILE=OFF \
@@ -41,7 +46,8 @@ jobs:
             -DLLAMA_BUILD_SERVER=OFF \
             -DLLAMA_CURL=OFF
 
-          cmake --build build-arm64 --config Release -j$(nproc)
+          # Kompilasi dengan 1 thread jika gagal agar pesan error C tepat terlihat di baris paling bawah
+          cmake --build build-arm64 --config Release -j$(nproc) || cmake --build build-arm64 --config Release -j1
 
       - name: 4. Kumpulkan Semua File .so ke jniLibs/arm64-v8a
         run: |
