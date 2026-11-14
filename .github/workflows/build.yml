@@ -12,23 +12,295 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Clone Resmi llama.cpp ke folder llama.cpp
+      - name: 2. Clone Resmi llama.cpp (Tag Stabil b4200)
         run: |
           rm -rf llama.cpp
-          git clone --depth 1 --branch b4600 https://github.com/ggerganov/llama.cpp.git llama.cpp
+          git clone --depth 1 --branch b4200 https://github.com/ggerganov/llama.cpp.git llama.cpp
 
-      - name: 3. Setup Android NDK r26d & CMake
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r26d
-          add-to-path: true
-
-      - name: 4. Kompilasi CMake untuk arm64-v8a
+      - name: 3. Siapkan CMakeLists.txt & llama_edusoho_jni.cpp yang 100% Kompatibel API b4200
         run: |
+          cat << 'EOF' > CMakeLists.txt
+          cmake_minimum_required(VERSION 3.22.1)
+          project("llama_edusoho" LANGUAGES C CXX)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+          add_compile_options(-O3 -ffast-math -funroll-loops)
+
+          set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+          set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+
+          add_subdirectory(llama.cpp)
+
+          add_library(
+              llama_edusoho
+              SHARED
+              llama_edusoho_jni.cpp
+          )
+
+          target_compile_definitions(llama_edusoho PRIVATE EDUSOHO_HAS_LLAMA_CPP=1)
+          target_include_directories(
+              llama_edusoho
+              PRIVATE
+              ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/include
+              ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/ggml/include
+          )
+
+          find_library(log-lib log)
+          find_library(android-lib android)
+
+          target_link_libraries(
+              llama_edusoho
+              llama
+              ggml
+              ${log-lib}
+              ${android-lib}
+          )
+          EOF
+
+          cat << 'EOF' > llama_edusoho_jni.cpp
+          #include <jni.h>
+          #include <android/log.h>
+          #include <fcntl.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <unistd.h>
+          #include <algorithm>
+          #include <cstdint>
+          #include <cstring>
+          #include <mutex>
+          #include <sstream>
+          #include <string>
+          #include <unordered_map>
+          #include <vector>
+          #include "llama.h"
+
+          #define LOG_TAG "LlamaEduSohoJNI"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          namespace {
+          struct GgufNativeModelSession {
+              std::string model_path;
+              int32_t n_ctx = 3072;
+              int32_t n_threads = 4;
+              uint64_t file_size_bytes = 0;
+              llama_model* model = nullptr;
+              llama_context* ctx = nullptr;
+          };
+
+          std::mutex g_sessions_mutex;
+          int64_t g_next_handle = 1000L;
+          std::unordered_map<int64_t, GgufNativeModelSession*> g_sessions;
+
+          void closeSessionResources(GgufNativeModelSession* session) {
+              if (!session) return;
+              if (session->ctx) {
+                  llama_free(session->ctx);
+                  session->ctx = nullptr;
+              }
+              if (session->model) {
+                  llama_free_model(session->model);
+                  session->model = nullptr;
+              }
+          }
+          } // namespace
+
+          extern "C" JNIEXPORT jlong JNICALL
+          Java_com_spt_edusoho_domain_rpm_gguf_LlamaCppBridge_nativeLoadGgufModel(
+                  JNIEnv* env,
+                  jclass /* clazz */,
+                  jstring modelPath,
+                  jint nCtx,
+                  jint nThreads) {
+              if (!modelPath) return 0L;
+              const char* raw_path = env->GetStringUTFChars(modelPath, nullptr);
+              if (!raw_path) return 0L;
+              std::string path_str(raw_path);
+              env->ReleaseStringUTFChars(modelPath, raw_path);
+
+              struct stat st {};
+              if (stat(path_str.c_str(), &st) != 0 || st.st_size < 24) {
+                  LOGE("Ukuran berkas GGUF tidak valid: %s", path_str.c_str());
+                  return 0L;
+              }
+
+              llama_backend_init();
+              llama_model_params mparams = llama_model_default_params();
+              mparams.use_mmap = true;
+              llama_model* model = llama_load_model_from_file(path_str.c_str(), mparams);
+              if (!model) {
+                  LOGE("llama_load_model_from_file gagal: %s", path_str.c_str());
+                  return 0L;
+              }
+
+              llama_context_params cparams = llama_context_default_params();
+              cparams.n_ctx = static_cast<uint32_t>(nCtx > 512 ? nCtx : 3072);
+              cparams.n_batch = 512;
+              cparams.n_threads = nThreads > 0 ? nThreads : 4;
+              cparams.n_threads_batch = cparams.n_threads;
+
+              llama_context* ctx = llama_new_context_with_model(model, cparams);
+              if (!ctx) {
+                  LOGE("llama_new_context_with_model gagal: %s", path_str.c_str());
+                  llama_free_model(model);
+                  return 0L;
+              }
+
+              auto* session = new GgufNativeModelSession();
+              session->model_path = path_str;
+              session->n_ctx = static_cast<int32_t>(cparams.n_ctx);
+              session->n_threads = cparams.n_threads;
+              session->file_size_bytes = static_cast<uint64_t>(st.st_size);
+              session->model = model;
+              session->ctx = ctx;
+
+              std::lock_guard<std::mutex> lock(g_sessions_mutex);
+              int64_t handle = ++g_next_handle;
+              g_sessions[handle] = session;
+
+              LOGI("Qwen GGUF berhasil dimuat penuh via llama.cpp C++: %s", path_str.c_str());
+              return static_cast<jlong>(handle);
+          }
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_spt_edusoho_domain_rpm_gguf_LlamaCppBridge_nativeCompletionChatMl(
+                  JNIEnv* env,
+                  jclass /* clazz */,
+                  jlong modelHandle,
+                  jstring chatMlPrompt,
+                  jint maxTokens,
+                  jfloat temperature) {
+              if (modelHandle == 0L || !chatMlPrompt) {
+                  return env->NewStringUTF("");
+              }
+
+              GgufNativeModelSession* session = nullptr;
+              {
+                  std::lock_guard<std::mutex> lock(g_sessions_mutex);
+                  auto it = g_sessions.find(static_cast<int64_t>(modelHandle));
+                  if (it != g_sessions.end()) {
+                      session = it->second;
+                  }
+              }
+              if (!session || !session->model || !session->ctx) {
+                  return env->NewStringUTF("");
+              }
+
+              const char* raw_prompt = env->GetStringUTFChars(chatMlPrompt, nullptr);
+              if (!raw_prompt) return env->NewStringUTF("");
+              std::string prompt_str(raw_prompt);
+              env->ReleaseStringUTFChars(chatMlPrompt, raw_prompt);
+
+              // Bersihkan KV cache sebelum evaluasi giliran baru
+              llama_kv_cache_clear(session->ctx);
+
+              std::vector<llama_token> tokens(prompt_str.size() + 64);
+              int n_tokens = llama_tokenize(
+                      session->model,
+                      prompt_str.c_str(),
+                      static_cast<int32_t>(prompt_str.size()),
+                      tokens.data(),
+                      static_cast<int32_t>(tokens.size()),
+                      true,
+                      true);
+              if (n_tokens < 0) {
+                  tokens.resize(-n_tokens);
+                  n_tokens = llama_tokenize(
+                          session->model,
+                          prompt_str.c_str(),
+                          static_cast<int32_t>(prompt_str.size()),
+                          tokens.data(),
+                          static_cast<int32_t>(tokens.size()),
+                          true,
+                          true);
+              }
+              if (n_tokens <= 0) {
+                  return env->NewStringUTF("");
+              }
+              tokens.resize(n_tokens);
+
+              int limit = maxTokens > 0 ? maxTokens : 420;
+              int max_input = session->n_ctx - limit - 32;
+              if (n_tokens > max_input && max_input > 256) {
+                  tokens.erase(tokens.begin(), tokens.end() - max_input);
+                  n_tokens = static_cast<int>(tokens.size());
+              }
+
+              const int chunk_size = 512;
+              for (int pos = 0; pos < n_tokens; pos += chunk_size) {
+                  int n_eval = std::min(chunk_size, n_tokens - pos);
+                  llama_batch batch = llama_batch_get_one(tokens.data() + pos, n_eval);
+                  if (llama_decode(session->ctx, batch) != 0) {
+                      LOGE("llama_decode gagal pada chunk %d", pos);
+                      return env->NewStringUTF("");
+                  }
+              }
+
+              auto sparams = llama_sampler_chain_default_params();
+              llama_sampler* smpl = llama_sampler_chain_init(sparams);
+              llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
+              llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.85f, 1));
+              llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature > 0.0f ? temperature : 0.40f));
+              llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+              std::string generated;
+              for (int i = 0; i < limit; ++i) {
+                  llama_token new_token_id = llama_sampler_sample(smpl, session->ctx, -1);
+                  if (llama_token_is_eog(session->model, new_token_id)) {
+                      break;
+                  }
+                  char buf[256];
+                  int n = llama_token_to_piece(session->model, new_token_id, buf, sizeof(buf), 0, true);
+                  if (n > 0) {
+                      generated.append(buf, n);
+                      if (generated.find("<|im_end|>") != std::string::npos ||
+                          generated.find("<|im_start|>") != std::string::npos ||
+                          generated.find("<|endoftext|>") != std::string::npos) {
+                          break;
+                      }
+                  }
+                  llama_batch next_batch = llama_batch_get_one(&new_token_id, 1);
+                  if (llama_decode(session->ctx, next_batch) != 0) {
+                      break;
+                  }
+              }
+              llama_sampler_free(smpl);
+              return env->NewStringUTF(generated.c_str());
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_spt_edusoho_domain_rpm_gguf_LlamaCppBridge_nativeFreeGgufModel(
+                  JNIEnv* /* env */,
+                  jclass /* clazz */,
+                  jlong modelHandle) {
+              if (modelHandle == 0L) return;
+              GgufNativeModelSession* session = nullptr;
+              {
+                  std::lock_guard<std::mutex> lock(g_sessions_mutex);
+                  auto it = g_sessions.find(static_cast<int64_t>(modelHandle));
+                  if (it != g_sessions.end()) {
+                      session = it->second;
+                      g_sessions.erase(it);
+                  }
+              }
+              if (session) {
+                  closeSessionResources(session);
+                  delete session;
+              }
+          }
+          EOF
+
+      - name: 4. Gunakan Android NDK Bawaan GitHub Runner & Kompilasi CMake (arm64-v8a)
+        run: |
+          echo "Menggunakan NDK bawaan di: $ANDROID_NDK_LATEST_HOME"
           mkdir -p build-arm64
           cmake -S . -B build-arm64 \
-            -DCMAKE_TOOLCHAIN_FILE="${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_shared \
@@ -40,17 +312,17 @@ jobs:
 
           cmake --build build-arm64 --config Release -j$(nproc)
 
-      - name: 5. Kumpulkan Semua File .so ke jniLibs/arm64-v8a
+      - name: 5. Kumpulkan Semua File .so + libc++_shared.so ke Struktur jniLibs/arm64-v8a
         run: |
           mkdir -p dist/jniLibs/arm64-v8a
           find build-arm64 -name "*.so" -exec cp {} dist/jniLibs/arm64-v8a/ \;
           
-          LIBCPP_PATH=$(find "${{ steps.setup-ndk.outputs.ndk-path }}" -name "libc++_shared.so" | grep "aarch64-linux-android" | head -n 1)
+          LIBCPP_PATH=$(find "$ANDROID_NDK_LATEST_HOME" -name "libc++_shared.so" | grep "aarch64-linux-android" | head -n 1)
           if [ -n "$LIBCPP_PATH" ]; then
             cp "$LIBCPP_PATH" dist/jniLibs/arm64-v8a/
           fi
 
-          STRIP_TOOL=$(find "${{ steps.setup-ndk.outputs.ndk-path }}" -name "llvm-strip" | head -n 1)
+          STRIP_TOOL=$(find "$ANDROID_NDK_LATEST_HOME" -name "llvm-strip" | head -n 1)
           if [ -n "$STRIP_TOOL" ]; then
             "$STRIP_TOOL" --strip-unneeded dist/jniLibs/arm64-v8a/*.so || true
           fi
